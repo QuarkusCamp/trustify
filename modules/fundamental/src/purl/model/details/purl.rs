@@ -1,14 +1,17 @@
+use crate::common::LicenseInfo;
+use crate::sbom::service::sbom::LicenseBasicInfo;
 use crate::{
     Error,
     advisory::model::AdvisoryHead,
+    common::{LicenseRefMapping, service::extract_license_ref_mappings},
     purl::model::{BasePurlHead, PurlHead, VersionedPurlHead},
-    sbom::model::SbomHead,
+    sbom::{model::SbomHead, service::SbomService},
     vulnerability::model::VulnerabilityHead,
 };
 use sea_orm::{
     ColumnTrait, ConnectionTrait, DbErr, EntityTrait, FromQueryResult, Iterable, LoaderTrait,
     ModelTrait, QueryFilter, QueryOrder, QueryResult, QuerySelect, QueryTrait, RelationTrait,
-    Select,
+    Select, SelectColumns,
 };
 use sea_query::{Asterisk, ColumnRef, Expr, Func, IntoIden, JoinType, SimpleExpr};
 use serde::{Deserialize, Serialize};
@@ -23,7 +26,8 @@ use trustify_cvss::cvss3::{Cvss3Base, score::Score, severity::Severity};
 use trustify_entity::{
     advisory, base_purl, cpe, cvss3, license, organization, product, product_status,
     product_version, product_version_range, purl_status, qualified_purl, sbom, sbom_package,
-    sbom_package_purl_ref, status, version_range, versioned_purl, vulnerability,
+    sbom_package_license, sbom_package_purl_ref, status, version_range, versioned_purl,
+    vulnerability,
 };
 use trustify_module_ingestor::common::{Deprecation, DeprecationForExt};
 use utoipa::ToSchema;
@@ -36,7 +40,15 @@ pub struct PurlDetails {
     pub version: VersionedPurlHead,
     pub base: BasePurlHead,
     pub advisories: Vec<PurlAdvisory>,
-    pub licenses: Vec<PurlLicenseSummary>,
+    pub licenses: Vec<LicenseInfo>,
+    pub licenses_ref_mapping: Vec<LicenseRefMapping>,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, ToSchema, FromQueryResult)]
+pub struct PurlLicenseResult {
+    pub sbom_id: Uuid,
+    pub license_name: String,
+    pub license_type: i32,
 }
 
 impl PurlDetails {
@@ -95,12 +107,49 @@ impl PurlDetails {
         )
         .await?;
 
+        let purl_license_results: Vec<PurlLicenseResult> = sbom_package_purl_ref::Entity::find()
+            .distinct()
+            .select_only()
+            .select_column(sbom_package::Column::SbomId)
+            .select_column_as(license::Column::Text, "license_name")
+            .select_column(sbom_package_license::Column::LicenseType)
+            .filter(sbom_package_purl_ref::Column::QualifiedPurlId.eq(qualified_package.id))
+            .join(
+                JoinType::Join,
+                sbom_package_purl_ref::Relation::Package.def(),
+            )
+            .join(JoinType::Join, sbom_package::Relation::PackageLicense.def())
+            .join(
+                JoinType::Join,
+                sbom_package_license::Relation::License.def(),
+            )
+            .into_model()
+            .all(tx)
+            .await?;
+
+        let mut purl_license_info = Vec::new();
+        let mut license_ref_mapping = Vec::new();
+
+        for plr in purl_license_results {
+            let licensing_infos = SbomService::get_licensing_infos(tx, plr.sbom_id).await?;
+            extract_license_ref_mappings(
+                plr.license_name.as_str(),
+                &licensing_infos,
+                &mut license_ref_mapping,
+            );
+            purl_license_info.push(LicenseInfo::from(LicenseBasicInfo {
+                license_name: plr.license_name,
+                license_type: plr.license_type,
+            }));
+        }
+
         Ok(PurlDetails {
             head: PurlHead::from_entity(&package, &package_version, qualified_package),
             version: VersionedPurlHead::from_entity(&package, &package_version),
             base: BasePurlHead::from_entity(&package),
             advisories: PurlAdvisory::from_entities(purl_statuses, product_statuses, tx).await?,
-            licenses: vec![], // Leave it empty for now and wait to add relevant content later.
+            licenses: purl_license_info,
+            licenses_ref_mapping: license_ref_mapping,
         })
     }
 }
